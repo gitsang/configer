@@ -1,4 +1,4 @@
-module github.com/gitsang/ddns
+module github.com/gitsang/configer
 
 go 1.22
 
