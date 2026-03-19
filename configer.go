@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/mcuadros/go-defaults"
+	"github.com/gitsang/defaults"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
@@ -49,12 +49,14 @@ func WithEnvBind(optfs ...OptionFunc) OptionFunc {
 
 func WithEnvPrefix(prefix string) OptionFunc {
 	return func(c *Configer) {
+		c.envPrefix = prefix
 		c.viper.SetEnvPrefix(prefix)
 	}
 }
 
 func WithEnvDelim(delim string) OptionFunc {
 	return func(c *Configer) {
+		c.envDelim = delim
 		c.viper.SetEnvKeyReplacer(strings.NewReplacer(".", delim))
 	}
 }
@@ -108,11 +110,6 @@ func (p *Configer) parseFlags(i interface{}, parents []string) {
 		if flagTag := f.Tag.Get("flag"); flagTag != "" {
 			flagName = flagTag
 		}
-
-		if f.Type.Kind() == reflect.Slice {
-			p.command.Flags().StringSlice(flagName, nil, f.Tag.Get("usage"))
-			continue
-		}
 		p.command.Flags().String(flagName, f.Tag.Get("default"), f.Tag.Get("usage"))
 
 		// viperKey use dot to addressing (mapstructure default) and should exclude the prefix
@@ -140,6 +137,18 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 			ft = ft.Elem()
 		}
 
+		// Handle map[string]Struct types
+		if ft.Kind() == reflect.Map && ft.Key().Kind() == reflect.String {
+			elemType := ft.Elem()
+			for elemType.Kind() == reflect.Ptr {
+				elemType = elemType.Elem()
+			}
+			if elemType.Kind() == reflect.Struct {
+				p.parseMapEnv(f, namespaces, elemType)
+				continue
+			}
+		}
+
 		if ft.Kind() == reflect.Struct {
 			fi := reflect.New(ft).Elem().Interface()
 			p.parseEnv(fi, namespaces)
@@ -155,9 +164,132 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 	}
 }
 
+// parseMapEnv handles parsing environment variables for map[string]Struct types
+// It looks for environment variables with pattern: PREFIX_MAPKEY_FIELDNAME
+// and converts them to map entries like map[MAPKEY]{FIELDNAME: value}
+func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, elemType reflect.Type) {
+	// Get all environment variables
+	envVars := os.Environ()
+
+	// Use default delimiter if not set
+	delim := p.envDelim
+	if delim == "" {
+		delim = "."
+	}
+
+	// Build the expected prefix for this map field
+	// Use env tag if available, otherwise use field name
+	fieldName := namespaces[len(namespaces)-1]
+	envTag := field.Tag.Get("env")
+	if envTag != "" {
+		fieldName = envTag
+	}
+
+	// Build prefix with the determined field name
+	// e.g., if namespaces is ["CONFIGER", "logs"], prefix will be "CONFIGER_LOGS_"
+	prefixNamespaces := make([]string, len(namespaces)-1)
+	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
+	prefixNamespaces = append(prefixNamespaces, strings.ToUpper(fieldName))
+	prefix := strings.ToUpper(strings.Join(prefixNamespaces, delim)) + delim
+
+	// Create a map to store env tag to field name mappings
+	fieldEnvMap := make(map[string]string)
+	for i := 0; i < elemType.NumField(); i++ {
+		structField := elemType.Field(i)
+		fieldName := strings.ToLower(structField.Name)
+		envTag := structField.Tag.Get("env")
+		if envTag != "" {
+			fieldEnvMap[strings.ToLower(envTag)] = fieldName
+		} else {
+			fieldEnvMap[fieldName] = fieldName
+		}
+	}
+
+	// Track found map keys and their field mappings
+	mapEntries := make(map[string]map[string]interface{})
+
+	// Parse environment variables to find matches
+	for _, envVar := range envVars {
+		parts := strings.SplitN(envVar, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		envKey := parts[0]
+		envValue := parts[1]
+
+		// Check if this env var matches our prefix pattern
+		if !strings.HasPrefix(envKey, prefix) {
+			continue
+		}
+
+		// Remove prefix to get the remaining part: MAPKEY_FIELDNAME
+		remaining := strings.TrimPrefix(envKey, prefix)
+		remainingParts := strings.Split(remaining, delim)
+
+		if len(remainingParts) < 2 {
+			continue
+		}
+
+		// First part is the map key, rest is the field path
+		mapKey := strings.ToLower(remainingParts[0])
+		fieldEnvTag := strings.ToLower(strings.Join(remainingParts[1:], "_"))
+
+		// Check if the field has an env tag and use the actual field name instead
+		fieldPath := fieldEnvTag
+		if fieldName, exists := fieldEnvMap[fieldEnvTag]; exists {
+			fieldPath = fieldName
+		}
+
+		// Initialize map entry if not exists
+		if mapEntries[mapKey] == nil {
+			mapEntries[mapKey] = make(map[string]interface{})
+		}
+
+		// Store the field mapping - handle nested structures properly
+		p.setNestedValue(mapEntries[mapKey], fieldPath, envValue)
+	}
+
+	// Set the entire map structure in viper and prevent AutomaticEnv from overriding it
+	if len(mapEntries) > 0 {
+		mapFieldKey := strings.Join(namespaces[1:], ".")
+		p.viper.Set(mapFieldKey, mapEntries)
+
+		// Explicitly bind the map field to prevent AutomaticEnv from overriding
+		// We bind it to a non-existent env var to prevent automatic binding
+		p.viper.BindEnv(mapFieldKey, "NONEXISTENT_ENV_VAR_"+mapFieldKey)
+	}
+}
+
+// setNestedValue sets a nested value in a map using dot notation
+func (p *Configer) setNestedValue(target map[string]interface{}, path string, value string) {
+	parts := strings.Split(path, ".")
+	current := target
+
+	// Navigate to the parent of the final key
+	for i := 0; i < len(parts)-1; i++ {
+		key := parts[i]
+		if current[key] == nil {
+			current[key] = make(map[string]interface{})
+		}
+		if nested, ok := current[key].(map[string]interface{}); ok {
+			current = nested
+		} else {
+			// If the current value is not a map, we can't navigate further
+			return
+		}
+	}
+
+	// Set the final value
+	finalKey := parts[len(parts)-1]
+	current[finalKey] = value
+}
+
 func New(optfs ...OptionFunc) *Configer {
 	c := &Configer{
-		viper: viper.New(),
+		viper: viper.NewWithOptions(
+			viper.ExperimentalBindStruct(), // https://github.com/spf13/viper/issues/1895
+		),
 	}
 	for _, apply := range optfs {
 		apply(c)
@@ -179,18 +311,41 @@ func (c *Configer) Load(config any, files ...string) error {
 	for _, file := range files {
 		c.viper.SetConfigFile(file)
 		if err := c.viper.ReadInConfig(); err != nil {
-			fmt.Printf("falied to read file %s: %s\n", file, err.Error())
+			fmt.Printf("failed to read file %s: %s\n", file, err.Error())
 			continue
 		}
 	}
-	defaults.SetDefaults(config)
-	return c.viper.Unmarshal(config)
+
+	if err := c.viper.Unmarshal(config); err != nil {
+		return err
+	}
+	if err := defaults.Set(config); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Debug method to help troubleshoot configuration issues
+func (c *Configer) Debug() {
+	fmt.Println("=== Debug: All Viper Keys and Values ===")
+	for _, key := range c.viper.AllKeys() {
+		fmt.Printf("Key: %s, Value: %v, Type: %T\n", key, c.viper.Get(key), c.viper.Get(key))
+	}
+
+	// Also print all environment variables that match our prefix
+	fmt.Println("\n=== Debug: Environment Variables ===")
+	envVars := os.Environ()
+	for _, envVar := range envVars {
+		if strings.HasPrefix(envVar, c.envPrefix) {
+			fmt.Println(envVar)
+		}
+	}
 }
 
 func (c *Configer) Store(config any, file string) error {
 	configYamlBytes, _ := yaml.Marshal(config)
 
-	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE, 0644)
+	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return err
 	}
