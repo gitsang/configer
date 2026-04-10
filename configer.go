@@ -287,9 +287,7 @@ func (p *Configer) setNestedValue(target map[string]interface{}, path string, va
 
 func New(optfs ...OptionFunc) *Configer {
 	c := &Configer{
-		viper: viper.NewWithOptions(
-			viper.ExperimentalBindStruct(), // https://github.com/spf13/viper/issues/1895
-		),
+		viper: viper.NewWithOptions(),
 	}
 	for _, apply := range optfs {
 		apply(c)
