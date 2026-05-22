@@ -1,0 +1,5 @@
+log:
+  enable: true
+  level: info
+
+server: {}

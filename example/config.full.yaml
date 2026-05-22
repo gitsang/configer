@@ -1,0 +1,30 @@
+log:
+  enable: true
+  level: info
+
+server:
+  labels:
+    env: production
+    region: us-east-1
+  ports:
+    http: 8080
+    https: 8443
+    grpc: 9090
+  features:
+    auth: true
+    cache: false
+    metrics: true
+  services:
+    user:
+      host: user-service.example.com
+      port: 8001
+    order:
+      host: order-service.example.com
+      port: 8002
+  advanced:
+    tags:
+      team: backend
+      project: api-gateway
+    routes:
+      "/api/v1": ["user", "order"]
+      "/api/v2": ["user"]

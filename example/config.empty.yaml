@@ -1,0 +1,12 @@
+log:
+  enable: true
+  level: info
+
+server:
+  labels: {}
+  ports: {}
+  features: {}
+  services: {}
+  advanced:
+    tags: {}
+    routes: {}
