@@ -1,6 +1,7 @@
 package configer
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -99,9 +100,18 @@ func (p *Configer) parseFlags(i interface{}, parents []string) {
 		f := r.Field(i)
 		namespaces := append(parents, strings.ToLower(f.Name))
 
-		if f.Type.Kind() == reflect.Struct {
-			t := reflect.New(f.Type).Elem().Interface()
+		ft := f.Type
+		for ft.Kind() == reflect.Ptr {
+			ft = ft.Elem()
+		}
+
+		if ft.Kind() == reflect.Struct {
+			t := reflect.New(ft).Elem().Interface()
 			p.parseFlags(t, namespaces)
+			continue
+		}
+
+		if ft.Kind() == reflect.Map {
 			continue
 		}
 
@@ -137,7 +147,7 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 			ft = ft.Elem()
 		}
 
-		// Handle map[string]Struct types
+		// Handle map[string]T types
 		if ft.Kind() == reflect.Map && ft.Key().Kind() == reflect.String {
 			elemType := ft.Elem()
 			for elemType.Kind() == reflect.Ptr {
@@ -147,6 +157,9 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 				p.parseMapEnv(f, namespaces, elemType)
 				continue
 			}
+			// Handle map[string]BasicType (string, int, bool, etc.)
+			p.parseBasicMapEnv(f, namespaces)
+			continue
 		}
 
 		if ft.Kind() == reflect.Struct {
@@ -261,7 +274,71 @@ func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, e
 	}
 }
 
-// setNestedValue sets a nested value in a map using dot notation
+// parseBasicMapEnv handles map[string]BasicType fields (e.g. map[string]string).
+// It supports two patterns:
+//   - Individual keys: PREFIX_FIELDNAME_KEY=value
+//   - JSON string:     PREFIX_FIELDNAME='{"key":"value"}'
+//
+// If entries are found, they are set in viper and the field is bound to a
+// non-existent env var to prevent AutomaticEnv from overriding with a raw string.
+func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []string) {
+	delim := p.envDelim
+	if delim == "" {
+		delim = "."
+	}
+
+	fieldName := namespaces[len(namespaces)-1]
+	envTag := field.Tag.Get("env")
+	if envTag != "" {
+		fieldName = envTag
+	}
+
+	prefixNamespaces := make([]string, len(namespaces)-1)
+	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
+	prefixNamespaces = append(prefixNamespaces, strings.ToUpper(fieldName))
+	prefix := strings.ToUpper(strings.Join(prefixNamespaces, delim)) + delim
+
+	mapEntries := make(map[string]interface{})
+
+	for _, envVar := range os.Environ() {
+		parts := strings.SplitN(envVar, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		envKey := parts[0]
+		envValue := parts[1]
+
+		if envKey == strings.TrimSuffix(prefix, delim) {
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(envValue), &parsed); err == nil {
+				for k, v := range parsed {
+					if s, ok := v.(string); ok {
+						mapEntries[strings.ToLower(k)] = s
+					} else {
+						mapEntries[strings.ToLower(k)] = fmt.Sprintf("%v", v)
+					}
+				}
+			}
+			continue
+		}
+
+		if !strings.HasPrefix(envKey, prefix) {
+			continue
+		}
+
+		remaining := strings.TrimPrefix(envKey, prefix)
+		mapKey := strings.ToLower(remaining)
+		mapEntries[mapKey] = envValue
+	}
+
+	mapFieldKey := strings.Join(namespaces[1:], ".")
+	if len(mapEntries) > 0 {
+		p.viper.Set(mapFieldKey, mapEntries)
+		p.viper.BindEnv(mapFieldKey, "NONEXISTENT_ENV_VAR_"+mapFieldKey)
+	}
+}
+
 func (p *Configer) setNestedValue(target map[string]interface{}, path string, value string) {
 	parts := strings.Split(path, ".")
 	current := target
