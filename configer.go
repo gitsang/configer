@@ -3,6 +3,7 @@ package configer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"strings"
@@ -28,7 +29,8 @@ type Options struct {
 
 type Configer struct {
 	Options
-	viper *viper.Viper
+	viper       *viper.Viper
+	conflicts   []string
 }
 
 type OptionFunc func(configer *Configer)
@@ -89,6 +91,41 @@ func WithFlagDelim(delim string) OptionFunc {
 	}
 }
 
+// getFieldName returns the effective field name for a struct field.
+// Priority: mapstructure tag > yaml tag > snake_case(field name)
+func getFieldName(f reflect.StructField) string {
+	if tag := f.Tag.Get("mapstructure"); tag != "" {
+		return tag
+	}
+	if tag := f.Tag.Get("yaml"); tag != "" {
+		return tag
+	}
+	return strings.ToLower(f.Name)
+}
+
+// checkFieldConflict checks if a field name contains the delimiter character
+// and records a warning if so.
+func (p *Configer) checkFieldConflict(fieldName string, namespaces []string) {
+	delim := p.envDelim
+	if delim == "" {
+		return
+	}
+	if strings.Contains(fieldName, delim) {
+		path := strings.Join(namespaces[1:], ".")
+		warning := fmt.Sprintf(
+			"WARNING: field %q contains delimiter %q, environment variable binding may be ambiguous. "+
+				"Consider using a different delimiter (e.g. \"__\") or renaming the field via mapstructure tag.",
+			path, delim,
+		)
+		p.conflicts = append(p.conflicts, warning)
+	}
+}
+
+// Warnings returns all collected warnings about potential configuration conflicts.
+func (c *Configer) Warnings() []string {
+	return c.conflicts
+}
+
 func (p *Configer) parseFlags(i interface{}, parents []string) {
 	r := reflect.TypeOf(i)
 
@@ -140,11 +177,20 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		namespaces := append(parents, strings.ToLower(f.Name))
+		fieldName := getFieldName(f)
+		namespaces := append(parents, fieldName)
+
+		p.checkFieldConflict(fieldName, namespaces)
 
 		ft := f.Type
 		for ft.Kind() == reflect.Ptr {
 			ft = ft.Elem()
+		}
+
+		// Handle slice types
+		if ft.Kind() == reflect.Slice {
+			p.parseSliceEnv(f, namespaces)
+			continue
 		}
 
 		// Handle map[string]T types
@@ -181,22 +227,14 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 // It looks for environment variables with pattern: PREFIX_MAPKEY_FIELDNAME
 // and converts them to map entries like map[MAPKEY]{FIELDNAME: value}
 func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, elemType reflect.Type) {
-	// Get all environment variables
 	envVars := os.Environ()
 
-	// Use default delimiter if not set
 	delim := p.envDelim
 	if delim == "" {
 		delim = "."
 	}
 
-	// Build the expected prefix for this map field
-	// Use env tag if available, otherwise use field name
 	fieldName := namespaces[len(namespaces)-1]
-	envTag := field.Tag.Get("env")
-	if envTag != "" {
-		fieldName = envTag
-	}
 
 	// Build prefix with the determined field name
 	// e.g., if namespaces is ["CONFIGER", "logs"], prefix will be "CONFIGER_LOGS_"
@@ -288,10 +326,6 @@ func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []stri
 	}
 
 	fieldName := namespaces[len(namespaces)-1]
-	envTag := field.Tag.Get("env")
-	if envTag != "" {
-		fieldName = envTag
-	}
 
 	prefixNamespaces := make([]string, len(namespaces)-1)
 	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
@@ -313,11 +347,7 @@ func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []stri
 			var parsed map[string]interface{}
 			if err := json.Unmarshal([]byte(envValue), &parsed); err == nil {
 				for k, v := range parsed {
-					if s, ok := v.(string); ok {
-						mapEntries[strings.ToLower(k)] = s
-					} else {
-						mapEntries[strings.ToLower(k)] = fmt.Sprintf("%v", v)
-					}
+					mapEntries[strings.ToLower(k)] = v
 				}
 			}
 			continue
@@ -337,6 +367,39 @@ func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []stri
 		p.viper.Set(mapFieldKey, mapEntries)
 		p.viper.BindEnv(mapFieldKey, "NONEXISTENT_ENV_VAR_"+mapFieldKey)
 	}
+}
+
+// parseSliceEnv handles slice types (e.g. []string, []int, []Struct).
+// It supports JSON string format: PREFIX_FIELDNAME='["value1","value2"]'
+//
+// If a value is found, it is set in viper and the field is bound to a
+// non-existent env var to prevent AutomaticEnv from overriding with a raw string.
+func (p *Configer) parseSliceEnv(field reflect.StructField, namespaces []string) {
+	delim := p.envDelim
+	if delim == "" {
+		delim = "."
+	}
+
+	fieldName := namespaces[len(namespaces)-1]
+
+	prefixNamespaces := make([]string, len(namespaces)-1)
+	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
+	prefixNamespaces = append(prefixNamespaces, strings.ToUpper(fieldName))
+	envKey := strings.ToUpper(strings.Join(prefixNamespaces, delim))
+
+	envValue := os.Getenv(envKey)
+	if envValue == "" {
+		return
+	}
+
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(envValue), &parsed); err != nil {
+		return
+	}
+
+	sliceFieldKey := strings.Join(namespaces[1:], ".")
+	p.viper.Set(sliceFieldKey, parsed)
+	p.viper.BindEnv(sliceFieldKey, "NONEXISTENT_ENV_VAR_"+sliceFieldKey)
 }
 
 func (p *Configer) setNestedValue(target map[string]interface{}, path string, value string) {
@@ -377,6 +440,10 @@ func New(optfs ...OptionFunc) *Configer {
 
 	if c.flagBind {
 		c.parseFlags(c.template, []string{c.flagPrefix})
+	}
+
+	for _, w := range c.conflicts {
+		log.Println(w)
 	}
 
 	return c

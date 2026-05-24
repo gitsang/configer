@@ -3,17 +3,30 @@ log:
   level: info
 
 server:
+  hosts:
+    - host1.example.com
+    - host2.example.com
+    - host3.example.com
+  ports:
+    - 8080
+    - 8443
+    - 9090
+  enabled:
+    - true
+    - false
+    - true
+  endpoints:
+    - host: endpoint1.example.com
+      port: 8001
+    - host: endpoint2.example.com
+      port: 8002
   labels:
     env: production
     region: us-east-1
-  ports:
+  port_map:
     http: 8080
     https: 8443
     grpc: 9090
-  features:
-    auth: true
-    cache: false
-    metrics: true
   services:
     user:
       host: user-service.example.com
@@ -23,8 +36,14 @@ server:
       port: 8002
   advanced:
     tags:
-      team: backend
-      project: api-gateway
-    routes:
-      "/api/v1": ["user", "order"]
-      "/api/v2": ["user"]
+      - tag1
+      - tag2
+      - tag3
+    config:
+      key1: value1
+      key2: value2
+    backends:
+      - host: backend1.example.com
+        port: 9001
+      - host: backend2.example.com
+        port: 9002

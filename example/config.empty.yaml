@@ -3,10 +3,14 @@ log:
   level: info
 
 server:
+  hosts: []
+  ports: []
+  enabled: []
+  endpoints: []
   labels: {}
-  ports: {}
-  features: {}
+  port_map: {}
   services: {}
   advanced:
-    tags: {}
-    routes: {}
+    tags: []
+    config: {}
+    backends: []
