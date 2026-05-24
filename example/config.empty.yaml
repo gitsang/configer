@@ -9,6 +9,7 @@ server:
   endpoints: []
   labels: {}
   port_map: {}
+  tags_by_service: {}
   services: {}
   advanced:
     tags: []

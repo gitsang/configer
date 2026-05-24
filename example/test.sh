@@ -110,7 +110,12 @@ OUTPUT=$(EXAMPLE_SERVER_PORT_MAP='{"http":3000,"https":3443}' go run . -c config
 run_test "map[string]int via JSON" bash -c 'EXAMPLE_SERVER_PORT_MAP='"'"'{"http":3000,"https":3443}'"'"' go run . -c config.full.yaml'
 check_output "Int map" "3000" "$OUTPUT"
 
-# Test 13: map[string]Struct via individual keys
+# Test 13: map[string][]string via JSON
+OUTPUT=$(EXAMPLE_SERVER_TAGS_BY_SERVICE='{"user":["admin","dev"],"order":["customer"]}' go run . -c config.full.yaml 2>&1)
+run_test "map[string][]string via JSON" bash -c 'EXAMPLE_SERVER_TAGS_BY_SERVICE='"'"'{"user":["admin","dev"],"order":["customer"]}'"'"' go run . -c config.full.yaml'
+check_output "String slice map" "admin" "$OUTPUT"
+
+# Test 14: map[string]Struct via individual keys
 OUTPUT=$(EXAMPLE_SERVER_SERVICES_USER_HOST=local.example.com EXAMPLE_SERVER_SERVICES_USER_PORT=9001 go run . -c config.full.yaml 2>&1)
 run_test "map[string]Struct via individual keys" bash -c "EXAMPLE_SERVER_SERVICES_USER_HOST=local.example.com EXAMPLE_SERVER_SERVICES_USER_PORT=9001 go run . -c config.full.yaml"
 check_output "Struct map" "local.example.com" "$OUTPUT"

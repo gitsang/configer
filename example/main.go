@@ -31,6 +31,8 @@ type Config struct {
 
 		PortMap map[string]int `yaml:"port_map" mapstructure:"port_map" usage:"server port map"`
 
+		TagsByService map[string][]string `yaml:"tags_by_service" mapstructure:"tags_by_service" usage:"tags by service"`
+
 		Services map[string]ServiceConfig `yaml:"services" mapstructure:"services" usage:"server services"`
 
 		Advanced struct {

@@ -126,6 +126,32 @@ func (c *Configer) Warnings() []string {
 	return c.conflicts
 }
 
+// getDelim returns the environment variable delimiter, defaulting to ".".
+func (p *Configer) getDelim() string {
+	if p.envDelim != "" {
+		return p.envDelim
+	}
+	return "."
+}
+
+// buildEnvKey builds an environment variable key from namespaces.
+// e.g., ["PREFIX", "server", "labels"] with delim "_" -> "PREFIX_SERVER_LABELS"
+func (p *Configer) buildEnvKey(namespaces []string) string {
+	return strings.ToUpper(strings.Join(namespaces, p.getDelim()))
+}
+
+// buildViperKey builds a viper key from namespaces (excluding prefix).
+// e.g., ["PREFIX", "server", "labels"] -> "server.labels"
+func buildViperKey(namespaces []string) string {
+	return strings.Join(namespaces[1:], ".")
+}
+
+// preventAutoOverride binds a viper key to a non-existent env var
+// to prevent AutomaticEnv from overriding the value.
+func (p *Configer) preventAutoOverride(viperKey string) {
+	p.viper.BindEnv(viperKey, "NONEXISTENT_ENV_VAR_"+viperKey)
+}
+
 func (p *Configer) parseFlags(i interface{}, parents []string) {
 	r := reflect.TypeOf(i)
 
@@ -135,7 +161,8 @@ func (p *Configer) parseFlags(i interface{}, parents []string) {
 
 	for i := 0; i < r.NumField(); i++ {
 		f := r.Field(i)
-		namespaces := append(parents, strings.ToLower(f.Name))
+		fieldName := getFieldName(f)
+		namespaces := append(parents, fieldName)
 
 		ft := f.Type
 		for ft.Kind() == reflect.Ptr {
@@ -148,19 +175,17 @@ func (p *Configer) parseFlags(i interface{}, parents []string) {
 			continue
 		}
 
-		if ft.Kind() == reflect.Map {
+		if ft.Kind() == reflect.Map || ft.Kind() == reflect.Slice {
 			continue
 		}
 
-		// trim delim prefix to avoid empty prefix
 		flagName := strings.TrimPrefix(strings.Join(namespaces, p.flagDelim), p.flagDelim)
 		if flagTag := f.Tag.Get("flag"); flagTag != "" {
 			flagName = flagTag
 		}
 		p.command.Flags().String(flagName, f.Tag.Get("default"), f.Tag.Get("usage"))
 
-		// viperKey use dot to addressing (mapstructure default) and should exclude the prefix
-		viperKey := strings.Join(namespaces[1:], ".")
+		viperKey := buildViperKey(namespaces)
 		err := p.viper.BindPFlag(viperKey, p.command.Flags().Lookup(flagName))
 		if err != nil {
 			continue
@@ -214,7 +239,7 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 			continue
 		}
 
-		viperKey := strings.Join(namespaces[1:], ".")
+		viperKey := buildViperKey(namespaces)
 		if envTag := f.Tag.Get("env"); envTag != "" {
 			if err := p.viper.BindEnv(viperKey, envTag); err != nil {
 				continue
@@ -227,40 +252,19 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 // It looks for environment variables with pattern: PREFIX_MAPKEY_FIELDNAME
 // and converts them to map entries like map[MAPKEY]{FIELDNAME: value}
 func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, elemType reflect.Type) {
-	envVars := os.Environ()
+	delim := p.getDelim()
+	prefix := p.buildEnvKey(namespaces) + delim
 
-	delim := p.envDelim
-	if delim == "" {
-		delim = "."
-	}
-
-	fieldName := namespaces[len(namespaces)-1]
-
-	// Build prefix with the determined field name
-	// e.g., if namespaces is ["CONFIGER", "logs"], prefix will be "CONFIGER_LOGS_"
-	prefixNamespaces := make([]string, len(namespaces)-1)
-	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
-	prefixNamespaces = append(prefixNamespaces, strings.ToUpper(fieldName))
-	prefix := strings.ToUpper(strings.Join(prefixNamespaces, delim)) + delim
-
-	// Create a map to store env tag to field name mappings
 	fieldEnvMap := make(map[string]string)
 	for i := 0; i < elemType.NumField(); i++ {
 		structField := elemType.Field(i)
-		fieldName := strings.ToLower(structField.Name)
-		envTag := structField.Tag.Get("env")
-		if envTag != "" {
-			fieldEnvMap[strings.ToLower(envTag)] = fieldName
-		} else {
-			fieldEnvMap[fieldName] = fieldName
-		}
+		subFieldName := getFieldName(structField)
+		fieldEnvMap[strings.ToLower(subFieldName)] = subFieldName
 	}
 
-	// Track found map keys and their field mappings
 	mapEntries := make(map[string]map[string]interface{})
 
-	// Parse environment variables to find matches
-	for _, envVar := range envVars {
+	for _, envVar := range os.Environ() {
 		parts := strings.SplitN(envVar, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -269,12 +273,10 @@ func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, e
 		envKey := parts[0]
 		envValue := parts[1]
 
-		// Check if this env var matches our prefix pattern
 		if !strings.HasPrefix(envKey, prefix) {
 			continue
 		}
 
-		// Remove prefix to get the remaining part: MAPKEY_FIELDNAME
 		remaining := strings.TrimPrefix(envKey, prefix)
 		remainingParts := strings.Split(remaining, delim)
 
@@ -282,33 +284,25 @@ func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, e
 			continue
 		}
 
-		// First part is the map key, rest is the field path
 		mapKey := strings.ToLower(remainingParts[0])
-		fieldEnvTag := strings.ToLower(strings.Join(remainingParts[1:], "_"))
+		subFieldKey := strings.ToLower(strings.Join(remainingParts[1:], "_"))
 
-		// Check if the field has an env tag and use the actual field name instead
-		fieldPath := fieldEnvTag
-		if fieldName, exists := fieldEnvMap[fieldEnvTag]; exists {
-			fieldPath = fieldName
+		fieldPath := subFieldKey
+		if name, exists := fieldEnvMap[subFieldKey]; exists {
+			fieldPath = name
 		}
 
-		// Initialize map entry if not exists
 		if mapEntries[mapKey] == nil {
 			mapEntries[mapKey] = make(map[string]interface{})
 		}
 
-		// Store the field mapping - handle nested structures properly
 		p.setNestedValue(mapEntries[mapKey], fieldPath, envValue)
 	}
 
-	// Set the entire map structure in viper and prevent AutomaticEnv from overriding it
 	if len(mapEntries) > 0 {
-		mapFieldKey := strings.Join(namespaces[1:], ".")
-		p.viper.Set(mapFieldKey, mapEntries)
-
-		// Explicitly bind the map field to prevent AutomaticEnv from overriding
-		// We bind it to a non-existent env var to prevent automatic binding
-		p.viper.BindEnv(mapFieldKey, "NONEXISTENT_ENV_VAR_"+mapFieldKey)
+		viperKey := buildViperKey(namespaces)
+		p.viper.Set(viperKey, mapEntries)
+		p.preventAutoOverride(viperKey)
 	}
 }
 
@@ -320,17 +314,9 @@ func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, e
 // If entries are found, they are set in viper and the field is bound to a
 // non-existent env var to prevent AutomaticEnv from overriding with a raw string.
 func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []string) {
-	delim := p.envDelim
-	if delim == "" {
-		delim = "."
-	}
-
-	fieldName := namespaces[len(namespaces)-1]
-
-	prefixNamespaces := make([]string, len(namespaces)-1)
-	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
-	prefixNamespaces = append(prefixNamespaces, strings.ToUpper(fieldName))
-	prefix := strings.ToUpper(strings.Join(prefixNamespaces, delim)) + delim
+	delim := p.getDelim()
+	prefix := p.buildEnvKey(namespaces) + delim
+	directKey := strings.TrimSuffix(prefix, delim)
 
 	mapEntries := make(map[string]interface{})
 
@@ -343,7 +329,7 @@ func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []stri
 		envKey := parts[0]
 		envValue := parts[1]
 
-		if envKey == strings.TrimSuffix(prefix, delim) {
+		if envKey == directKey {
 			var parsed map[string]interface{}
 			if err := json.Unmarshal([]byte(envValue), &parsed); err == nil {
 				for k, v := range parsed {
@@ -362,10 +348,10 @@ func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []stri
 		mapEntries[mapKey] = envValue
 	}
 
-	mapFieldKey := strings.Join(namespaces[1:], ".")
 	if len(mapEntries) > 0 {
-		p.viper.Set(mapFieldKey, mapEntries)
-		p.viper.BindEnv(mapFieldKey, "NONEXISTENT_ENV_VAR_"+mapFieldKey)
+		viperKey := buildViperKey(namespaces)
+		p.viper.Set(viperKey, mapEntries)
+		p.preventAutoOverride(viperKey)
 	}
 }
 
@@ -375,18 +361,7 @@ func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []stri
 // If a value is found, it is set in viper and the field is bound to a
 // non-existent env var to prevent AutomaticEnv from overriding with a raw string.
 func (p *Configer) parseSliceEnv(field reflect.StructField, namespaces []string) {
-	delim := p.envDelim
-	if delim == "" {
-		delim = "."
-	}
-
-	fieldName := namespaces[len(namespaces)-1]
-
-	prefixNamespaces := make([]string, len(namespaces)-1)
-	copy(prefixNamespaces, namespaces[:len(namespaces)-1])
-	prefixNamespaces = append(prefixNamespaces, strings.ToUpper(fieldName))
-	envKey := strings.ToUpper(strings.Join(prefixNamespaces, delim))
-
+	envKey := p.buildEnvKey(namespaces)
 	envValue := os.Getenv(envKey)
 	if envValue == "" {
 		return
@@ -397,9 +372,9 @@ func (p *Configer) parseSliceEnv(field reflect.StructField, namespaces []string)
 		return
 	}
 
-	sliceFieldKey := strings.Join(namespaces[1:], ".")
-	p.viper.Set(sliceFieldKey, parsed)
-	p.viper.BindEnv(sliceFieldKey, "NONEXISTENT_ENV_VAR_"+sliceFieldKey)
+	viperKey := buildViperKey(namespaces)
+	p.viper.Set(viperKey, parsed)
+	p.preventAutoOverride(viperKey)
 }
 
 func (p *Configer) setNestedValue(target map[string]interface{}, path string, value string) {

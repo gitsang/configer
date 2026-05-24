@@ -27,6 +27,13 @@ server:
     http: 8080
     https: 8443
     grpc: 9090
+  tags_by_service:
+    user:
+      - admin
+      - backend
+    order:
+      - customer
+      - payment
   services:
     user:
       host: user-service.example.com
