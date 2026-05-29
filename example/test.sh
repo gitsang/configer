@@ -118,14 +118,19 @@ check_output "String slice map" "admin" "$OUTPUT"
 # Test 14: map[string]Struct via individual keys
 OUTPUT=$(EXAMPLE_SERVER_SERVICES_USER_HOST=local.example.com EXAMPLE_SERVER_SERVICES_USER_PORT=9001 go run . -c config.full.yaml 2>&1)
 run_test "map[string]Struct via individual keys" bash -c "EXAMPLE_SERVER_SERVICES_USER_HOST=local.example.com EXAMPLE_SERVER_SERVICES_USER_PORT=9001 go run . -c config.full.yaml"
-check_output "Struct map" "local.example.com" "$OUTPUT"
+check_output "Struct map individual" "local.example.com" "$OUTPUT"
+
+# Test 15: map[string]Struct via JSON
+OUTPUT=$(EXAMPLE_SERVER_SERVICES='{"user":{"host":"json-user.example.com","port":8888},"order":{"host":"json-order.example.com","port":9999}}' go run . -c config.full.yaml 2>&1)
+run_test "map[string]Struct via JSON" bash -c 'EXAMPLE_SERVER_SERVICES='"'"'{"user":{"host":"json-user.example.com","port":8888},"order":{"host":"json-order.example.com","port":9999}}'"'"' go run . -c config.full.yaml'
+check_output "Struct map JSON" "json-user.example.com" "$OUTPUT"
 
 echo ""
 echo "=========================================="
 echo "4. Nested struct tests"
 echo "=========================================="
 
-# Test 14: Nested []string via JSON
+# Test 16: Nested []string via JSON
 OUTPUT=$(EXAMPLE_SERVER_ADVANCED_TAGS='["new-tag1","new-tag2"]' go run . -c config.full.yaml 2>&1)
 run_test "Nested []string via JSON" bash -c 'EXAMPLE_SERVER_ADVANCED_TAGS='"'"'["new-tag1","new-tag2"]'"'"' go run . -c config.full.yaml'
 check_output "Nested slice" "new-tag1" "$OUTPUT"

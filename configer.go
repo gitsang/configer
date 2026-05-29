@@ -212,13 +212,7 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 			ft = ft.Elem()
 		}
 
-		// Handle slice types
-		if ft.Kind() == reflect.Slice {
-			p.parseSliceEnv(f, namespaces)
-			continue
-		}
-
-		// Handle map[string]T types
+		// Handle map[string]Struct types (special case with nested fields)
 		if ft.Kind() == reflect.Map && ft.Key().Kind() == reflect.String {
 			elemType := ft.Elem()
 			for elemType.Kind() == reflect.Ptr {
@@ -228,8 +222,11 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 				p.parseMapEnv(f, namespaces, elemType)
 				continue
 			}
-			// Handle map[string]BasicType (string, int, bool, etc.)
-			p.parseBasicMapEnv(f, namespaces)
+		}
+
+		// Handle slice and map[string]BasicType via JSON
+		if ft.Kind() == reflect.Slice || (ft.Kind() == reflect.Map && ft.Key().Kind() == reflect.String) {
+			p.parseJSONEnv(f, namespaces)
 			continue
 		}
 
@@ -248,12 +245,74 @@ func (p *Configer) parseEnv(i interface{}, parents []string) {
 	}
 }
 
-// parseMapEnv handles parsing environment variables for map[string]Struct types
-// It looks for environment variables with pattern: PREFIX_MAPKEY_FIELDNAME
-// and converts them to map entries like map[MAPKEY]{FIELDNAME: value}
+// parseJSONEnv handles slice and map[string]BasicType fields via JSON.
+// It supports:
+//   - Direct JSON:  PREFIX_FIELDNAME='["value1","value2"]' or '{"key":"value"}'
+//   - Individual keys for map: PREFIX_FIELDNAME_KEY=value (only for map types)
+func (p *Configer) parseJSONEnv(field reflect.StructField, namespaces []string) {
+	ft := field.Type
+	for ft.Kind() == reflect.Ptr {
+		ft = ft.Elem()
+	}
+	isMap := ft.Kind() == reflect.Map
+
+	delim := p.getDelim()
+	prefix := p.buildEnvKey(namespaces) + delim
+	directKey := strings.TrimSuffix(prefix, delim)
+
+	var result interface{}
+	mapEntries := make(map[string]interface{})
+
+	for _, envVar := range os.Environ() {
+		parts := strings.SplitN(envVar, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		envKey, envValue := parts[0], parts[1]
+
+		// Direct JSON value
+		if envKey == directKey {
+			if err := json.Unmarshal([]byte(envValue), &result); err == nil {
+				if !isMap {
+					viperKey := buildViperKey(namespaces)
+					p.viper.Set(viperKey, result)
+					p.preventAutoOverride(viperKey)
+					return
+				}
+				// For map, merge into mapEntries
+				if m, ok := result.(map[string]interface{}); ok {
+					for k, v := range m {
+						mapEntries[strings.ToLower(k)] = v
+					}
+				}
+			}
+			continue
+		}
+
+		// Individual keys (map only)
+		if isMap && strings.HasPrefix(envKey, prefix) {
+			remaining := strings.TrimPrefix(envKey, prefix)
+			mapKey := strings.ToLower(remaining)
+			mapEntries[mapKey] = envValue
+		}
+	}
+
+	if len(mapEntries) > 0 {
+		viperKey := buildViperKey(namespaces)
+		p.viper.Set(viperKey, mapEntries)
+		p.preventAutoOverride(viperKey)
+	}
+}
+
+// parseMapEnv handles map[string]Struct types with nested fields.
+// It supports two patterns:
+//   - JSON string:     PREFIX_FIELDNAME='{"key":{"field":"value"}}'
+//   - Individual keys: PREFIX_FIELDNAME_MAPKEY_FIELDNAME=value
 func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, elemType reflect.Type) {
 	delim := p.getDelim()
 	prefix := p.buildEnvKey(namespaces) + delim
+	directKey := strings.TrimSuffix(prefix, delim)
 
 	fieldEnvMap := make(map[string]string)
 	for i := 0; i < elemType.NumField(); i++ {
@@ -270,9 +329,22 @@ func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, e
 			continue
 		}
 
-		envKey := parts[0]
-		envValue := parts[1]
+		envKey, envValue := parts[0], parts[1]
 
+		// Try JSON format first
+		if envKey == directKey {
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(envValue), &parsed); err == nil {
+				for mapKey, mapValue := range parsed {
+					if m, ok := mapValue.(map[string]interface{}); ok {
+						mapEntries[strings.ToLower(mapKey)] = m
+					}
+				}
+			}
+			continue
+		}
+
+		// Individual keys format
 		if !strings.HasPrefix(envKey, prefix) {
 			continue
 		}
@@ -304,77 +376,6 @@ func (p *Configer) parseMapEnv(field reflect.StructField, namespaces []string, e
 		p.viper.Set(viperKey, mapEntries)
 		p.preventAutoOverride(viperKey)
 	}
-}
-
-// parseBasicMapEnv handles map[string]BasicType fields (e.g. map[string]string).
-// It supports two patterns:
-//   - Individual keys: PREFIX_FIELDNAME_KEY=value
-//   - JSON string:     PREFIX_FIELDNAME='{"key":"value"}'
-//
-// If entries are found, they are set in viper and the field is bound to a
-// non-existent env var to prevent AutomaticEnv from overriding with a raw string.
-func (p *Configer) parseBasicMapEnv(field reflect.StructField, namespaces []string) {
-	delim := p.getDelim()
-	prefix := p.buildEnvKey(namespaces) + delim
-	directKey := strings.TrimSuffix(prefix, delim)
-
-	mapEntries := make(map[string]interface{})
-
-	for _, envVar := range os.Environ() {
-		parts := strings.SplitN(envVar, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		envKey := parts[0]
-		envValue := parts[1]
-
-		if envKey == directKey {
-			var parsed map[string]interface{}
-			if err := json.Unmarshal([]byte(envValue), &parsed); err == nil {
-				for k, v := range parsed {
-					mapEntries[strings.ToLower(k)] = v
-				}
-			}
-			continue
-		}
-
-		if !strings.HasPrefix(envKey, prefix) {
-			continue
-		}
-
-		remaining := strings.TrimPrefix(envKey, prefix)
-		mapKey := strings.ToLower(remaining)
-		mapEntries[mapKey] = envValue
-	}
-
-	if len(mapEntries) > 0 {
-		viperKey := buildViperKey(namespaces)
-		p.viper.Set(viperKey, mapEntries)
-		p.preventAutoOverride(viperKey)
-	}
-}
-
-// parseSliceEnv handles slice types (e.g. []string, []int, []Struct).
-// It supports JSON string format: PREFIX_FIELDNAME='["value1","value2"]'
-//
-// If a value is found, it is set in viper and the field is bound to a
-// non-existent env var to prevent AutomaticEnv from overriding with a raw string.
-func (p *Configer) parseSliceEnv(field reflect.StructField, namespaces []string) {
-	envKey := p.buildEnvKey(namespaces)
-	envValue := os.Getenv(envKey)
-	if envValue == "" {
-		return
-	}
-
-	var parsed interface{}
-	if err := json.Unmarshal([]byte(envValue), &parsed); err != nil {
-		return
-	}
-
-	viperKey := buildViperKey(namespaces)
-	p.viper.Set(viperKey, parsed)
-	p.preventAutoOverride(viperKey)
 }
 
 func (p *Configer) setNestedValue(target map[string]interface{}, path string, value string) {
